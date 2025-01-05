@@ -1,0 +1,708 @@
+---
+title: "Cronotipo"
+author: "Laura Llamas López"
+date: "2024-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Primero, cargar todas las librerías que vamos a necesitar
+
+```{r}
+
+library(semanticCRFR)
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(doParallel)
+library(dplyr)
+library(ranger)
+library(naivebayes)
+
+```
+
+Definir el código de identificación de cada constante
+
+```{r}
+
+KRONO <- 11847
+ID_SALIDAS_CIRCADIANAS <- 522
+ID_VARIABLES_CIRCADIANAS <- 523
+ID_VARIABLES_SUJETO <- 329
+
+```
+
+Iniciar sesión para tener acceso a los datos de Krono
+
+```{r}
+
+milogin <- authRimib::imib_auth(
+  username = "laurallamas",
+  password = "@Laura1234"
+)
+
+```
+
+Es necesario hacer un arreglo manual para que el código funcione debido a problemas con el paquete de autenticación 
+
+```{r}
+
+milogin$policies$auth_oauth <- list()
+milogin$policies$auth_oauth$cache <- milogin$policies$auth_sign$params$cache
+
+```
+
+Descarga de datos
+
+```{r}
+
+patients <- get_patients(
+  auth = milogin,
+  project = 11847
+)
+
+salidas_circadianas <- get_entity(
+  auth = milogin,
+  project = KRONO,
+  entity = ID_SALIDAS_CIRCADIANAS
+)
+
+variables_circadianas <- get_entity(
+  auth = milogin,
+  project = KRONO,
+  entity = ID_VARIABLES_CIRCADIANAS
+)
+
+variables_sujeto <- get_entity(
+  auth = milogin,
+  project = KRONO,
+  entity = ID_VARIABLES_SUJETO
+)
+
+```
+
+Unir los datos descargados para generar un único dataframe
+
+```{r}
+
+union1 <- merge(patients, salidas_circadianas, by.x = "id_paciente", by.y = "id_paciente")
+union2 <- merge(union1, variables_circadianas, by.x = "id_paciente", by.y = "id_paciente")
+df_final <- merge(union2, variables_sujeto, by.x = "id_paciente", by.y = "id_paciente")
+
+```
+
+Definir una función que elimina filas y columnas con NA (la función train que usaremos posteriormente falla si hay algún NA)
+
+```{r}
+
+eliminar_filas_columnas_na <- function(df_final) {
+  data_clean <- df_final[, colSums(is.na(df_final)) == 0]
+  data_clean <- data_clean[rowSums(is.na(data_clean)) == 0, ]
+  return(data_clean)
+}
+
+```
+
+Eliminar muestras duplicadas, columnas+filas con valores NA, columnas con varianza 0 (eliminar ruido) y la variable "cronotipo_numero_cronotipo_number", ya que el cronotipo se asigna directamente a partir de ella
+
+```{r}
+
+df_final <- df_final[,c(-2,-8)]
+df_final <- df_final %>% filter(!is.na(crono_tipo_etiqueta_cronotipo_label)) %>% distinct(id_paciente, .keep_all = T)
+
+df_final <- eliminar_filas_columnas_na(df_final)
+
+zero_var_cols <- nearZeroVar(df_final)
+df_final <- df_final[, -zero_var_cols]
+
+df_final <- df_final %>% select(-c(cronotipo_numero_cronotipo_number))
+
+```
+
+Asegurar que la variable "crono_tipo_etiqueta_cronotipo_label" es de tipo factor
+
+```{r}
+
+df_final$crono_tipo_etiqueta_cronotipo_label <- as.factor(df_final$crono_tipo_etiqueta_cronotipo_label)
+
+```
+
+Dejar solo columnas con valores de tipo numérico, lógico o factor 
+
+```{r}
+
+df_final <- df_final %>%
+  select_if(~ is.numeric(.) | is.logical(.) | is.factor(.))
+
+```
+
+Eliminar variables que no aportan información relevante para facilitar el manejo de los datos.
+
+```{r}
+
+df_final <- df_final %>% select(-c(visita_paciente.x, form.x, visita_paciente.y, form.y, visita_paciente, form))
+
+```
+
+Asignar la primera columna, correspondiente al ID del paciente, como nombre de las filas
+
+```{r}
+
+rownames(df_final) <- df_final[,1]
+df_final <- df_final[,-1]
+
+```
+
+Dividir los datos en entrenamiento y prueba mediante una partición con la función createDataPartition. Argumentos:
+df_final$crono_tipo_etiqueta_cronotipo_label es la columna a partir de la cual se realiza la partición
+p = 0.85 es el porcentaje que se asignará a entrenamiento (el 15% será empleado para evaluar)
+list = FALSE indica que la salida no será una lista, sino un vector de índices
+
+```{r}
+
+set.seed(1234)
+
+rf_particion_2 <- createDataPartition(df_final$crono_tipo_etiqueta_cronotipo_label, p=0.85, list = FALSE)
+rf_train_data <- df_final[rf_particion_2,]
+rf_test_data <- df_final[-rf_particion_2,]
+
+x_train_prueba <- rf_train_data[, colnames(rf_train_data) != "crono_tipo_etiqueta_cronotipo_label"]
+y_train_prueba <- rf_train_data[, colnames(rf_train_data) == "crono_tipo_etiqueta_cronotipo_label"]
+
+```
+
+Selección de variables con RFE-RF
+
+```{r}
+
+set.seed(1234)
+seeds <- list(
+  sample.int(1000, 200), #Para el fold 1 
+  sample.int(1000, 200), #Para el fold 2
+  sample.int(1000, 200), #Para el fold 3
+  sample.int(1000, 200), #Para el fold 4
+  sample.int(1000, 200), #Para el fold 5 
+  sample.int(1000, 1)    #Una sola semilla final
+)
+
+control_rfe_rf <- rfeControl(functions = rfFuncs,
+                            method = "repeatedcv",
+                            repeats = 1,
+                            number = 5,
+                            allowParallel = TRUE,
+                            seeds = seeds)
+
+```
+
+```{r}
+
+set.seed(1234)
+
+tiempo <- Sys.time()
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+tamaños <- c(5,10,20,30,40,50,70,90,110,130,150,170,190,200)
+
+
+
+resultado_rfe_rf <- rfe(x = x_train_prueba,
+                       y = y_train_prueba,
+                       sizes = tamaños,
+                       rfeControl = control_rfe_rf)
+
+
+tiempo.fin <- Sys.time() - tiempo
+print(tiempo.fin)
+
+stopCluster(cl)
+
+saveRDS(resultado_rfe_rf, file = "resultado_rfe_rf")
+
+```
+
+Visualizar el tamaño del subconjunto óptimo y las variables que lo conforman
+
+```{r}
+
+plot(resultado_rfe_rf)
+resultado_rfe_rf$optVariables
+resultado_rfe_rf$optsize
+
+```
+
+```{r}
+
+df_post_rfe <- df_final[,c(resultado_rfe_rf$optVariables, "crono_tipo_etiqueta_cronotipo_label")]
+rf_train_data <- rf_train_data[,c(resultado_rfe_rf$optVariables, "crono_tipo_etiqueta_cronotipo_label")]
+rf_test_data <- rf_test_data[,c(resultado_rfe_rf$optVariables, "crono_tipo_etiqueta_cronotipo_label")]
+
+```
+
+Establecer una semilla aleatoria para garantizar resultados reproducibles.
+
+trainControl() especifica parámetros a emplear en el entrenamiento del modelo y permite configurar la validación cruzada.
+
+method = "repeatedcv" especifica que se empleará el método de validación cruzada repetida. 
+
+number indica el número de folds (subconjuntos) usados en la validación cruzada: los datos se van a dividir en 5 subconjuntos y en cada iteración se utilizan 4 de los 5 subconjuntos para entrenar el modelo y el restante para evaluarlo.
+
+repeat indica que la validación cruzada se realizará una sola vez.
+
+seeds establecería semillas para el generador de números aleatorios que se utiliza para dividir los datos en los folds. Como en este caso se indica "NULL" se tomará la semilla establecida previamente con set.seed(1234).
+
+returnResamp indica qué hacer con las muestras de validación. En este caso, con "all" se conservan y devuelven todas las muestras como parte del resultado.
+
+verboseIter controla si se muestra o no el progreso de cada iteración
+
+allowParallel permite que el entrenamiento se ejecute en paralelo para aprovechar múltiples núcleos de CPU.
+
+```{r}
+
+set.seed(1234)
+
+seeds_train <- list(
+  sample.int(1000, 200),  
+  sample.int(1000, 200),  
+  sample.int(1000, 200),  
+  sample.int(1000, 200),  
+  sample.int(1000, 200),
+  sample.int(1000, 1)
+)
+
+control.cv.10 <- trainControl(method = "repeatedcv", 
+                                  number = 5,
+                                  repeats = 1,
+                                  seeds = seeds_train, 
+                                  returnResamp = "all",
+                                  verboseIter = FALSE,
+                                  allowParallel = TRUE)
+
+```
+
+SVM LINEAL
+
+Guardar en la variable "tiempo" la fecha y hora actuales para  posteriormente medir cuanto tarda el proceso
+
+Crear clúster de 5 núcleos para ejecutar tareas en paralelo
+Registrar el clúster con registerDoParallel
+
+expand.grid ajusta hiperparámetros. En este caso, con cost se ajusta la penalización de errores en el modelo
+
+Entrenar el modelo con el método SVM lineal:
+
+crono_tipo_etiqueta_cronotipo_label ~ . indica que se emplea como variable dependiente (crono_tipo_etiqueta_cronotipo_label) y el resto como predictores (.)
+
+data especifica que el conjunto de datos para el entrenamiento es rf_train_data
+
+method especifica el método
+
+tune.grid especifica los hiperparámetros que se deben emplear
+
+metric indica qué métrica se emplea para evaluar el rendimiento, en este caso la precisión global ("Accuracy")
+
+preProcess va a centrar y escalar los datos
+
+trControl utiliza el objeto "control.cv.10" definido previamente para controlar como se realiza la validación cruzada
+
+En "tiempo.fin" se guarda el tiempo transcurrido restando el tiempo inicial al tiempo actual
+
+stopCluster(cl) detiene el cluster y libera los recursos del sistema
+
+Guardar el modelo entrenado junto con los resultados de la validación cruzada y los parámetros ajustados. Esto se hace para poder usar el modelo sin necesidad de entrenarlo de nuevo
+
+```{r}
+
+set.seed(1234)
+
+tiempo <- Sys.time()
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+
+
+param.lineal <- expand.grid(cost = c(0.001, 0.01, 0.1, 10, 100))
+
+rf_training.svm.lineal <- train(crono_tipo_etiqueta_cronotipo_label ~ ., data = rf_train_data,
+                      method = "svmLinear2",
+                      tuneGrid = param.lineal,
+                      metric = "Accuracy",
+                      preProcess = c("center", "scale"),
+                      trControl = control.cv.10)
+
+tiempo.fin <- Sys.time() - tiempo
+print(tiempo.fin)
+
+stopCluster(cl)
+
+saveRDS(rf_training.svm.lineal, "modelo_rf_svml_krono")
+
+```
+
+Extraer mejor valor de "Accuracy" de los resultados del modelo SVM lineal entrenado previamente 
+
+```{r}
+
+rf_mejor_svml_664 <- rf_training.svm.lineal$results[order(rf_training.svm.lineal$results$Accuracy, decreasing = TRUE),][1,]["Accuracy"]
+
+```
+
+SVM RADIAL
+
+Configurar un objeto para realizar un ajuste con búsqueda aleatoria. Para ello, se añade el argumento search = "random" . En lugar de probar todas las combinaciones posibles de hiperparámetros, la búsqueda aleatoria selecciona aleatoriamente diferentes combinaciones, lo que puede ser más eficiente, especialmente cuando hay muchos parámetros para probar.
+
+Entrenar el modelo con el método SVM radial:
+
+tune.length indica que se buscarán 15 combinaciones de hiperparámetros automáticamente
+
+```{r}
+
+set.seed(1234)
+
+random.cv.10 <- trainControl(method = "repeatedcv", 
+                                  number = 5,
+                                  repeats = 1,
+                                  seeds = seeds_train, 
+                                  returnResamp = "all",
+                                  search = "random",
+                                  verboseIter = FALSE,
+                                  allowParallel = TRUE)
+
+tiempo <- Sys.time()
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+rf_training.svm.radial <- train(crono_tipo_etiqueta_cronotipo_label ~ ., data = rf_train_data,
+                      method = "svmRadial",
+                      tuneLength = 15,
+                      metric = "Accuracy",
+                      preProcess = c("center", "scale"),
+                      trControl = random.cv.10)
+
+
+tiempo.fin <- Sys.time() - tiempo
+print(tiempo.fin)
+
+
+stopCluster(cl)
+
+saveRDS(rf_training.svm.radial, "modelo_rf_svmr_krono")
+
+```
+
+Extraer mejor valor de "Accuracy" de los resultados del modelo SVM radial entrenado previamente
+
+```{r}
+
+rf_mejor_svmr_664 <- rf_training.svm.radial$results[order(rf_training.svm.radial$results$Accuracy, decreasing = TRUE),][1,]["Accuracy"]
+
+```
+
+SVM POLINOMIAL
+
+Mismo procedimiento que con el lineal pero empleando el método polinomial
+
+```{r}
+
+set.seed(1234)
+
+tiempo <- Sys.time()
+
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+param.polinomial <- expand.grid(C = c(0.01,0.05,0.1,0.2,0.5,1,5), degree = c(1,2,3), scale = c(0.01,0.1,1))
+
+rf_training.svm.polinomial <- train(crono_tipo_etiqueta_cronotipo_label ~ ., data = rf_train_data,
+                      method = "svmPoly",
+                      tuneGrid = param.polinomial,
+                      metric = "Accuracy",
+                      preProcess = c("center", "scale"),
+                      trControl = control.cv.10)
+
+
+tiempo.fin <- Sys.time() - tiempo
+print(tiempo.fin)
+
+
+stopCluster(cl)
+
+saveRDS(rf_training.svm.polinomial, "modelo_rf_svmp_krono")
+
+
+```
+
+```{r}
+
+rf_mejor_svmp_664 <- rf_training.svm.polinomial$results[order(rf_training.svm.polinomial$results$Accuracy, decreasing = TRUE),][1,]["Accuracy"]
+
+```
+
+RANDOM FOREST
+
+Calcular la raíz cuadrada del número de columnas del conjunto de datos y guardarlo en "raiz_variables"
+
+expand.grid crea un data frame con todas las combinaciones posibles de los valores de los tres hiperparámetros definidos:
+
+mtry especifica el número de variables aleatorias que se considerarán en cada división de un árbol de decisión dentro del bosque aleatorio
+
+min.node.size determina el número mínimo de observaciones requeridas en un nodo terminal del árbol
+
+splitrule criterio de división utilizado para dividir los nodos del árbol de decisión
+
+```{r}
+
+raiz_variables <- round(sqrt(ncol(rf_train_data)))
+
+tunegrid.rf.1 <- expand.grid(mtry = c(raiz_variables-10,raiz_variables-5,raiz_variables-3, raiz_variables,raiz_variables+3, raiz_variables+6, raiz_variables+10, raiz_variables+20),
+                            min.node.size = c(1,2,3,4,5),
+                            splitrule = c("gini","extratrees","hellinger"))
+
+
+
+set.seed(1234)
+
+tiempo <- Sys.time()
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+rf_training.rf.1 <- train(crono_tipo_etiqueta_cronotipo_label ~ ., data = rf_train_data,
+                      method = "ranger",
+                      tuneGrid = tunegrid.rf.1,
+                      metric = "Accuracy",
+                      preProcess = c("center", "scale"),
+                      trControl = control.cv.10)
+
+tiempo.fin <- Sys.time() - tiempo
+print(tiempo.fin)
+
+stopCluster(cl)
+
+saveRDS(rf_training.rf.1, "modelo_rf_rf_krono")
+
+```
+
+```{r}
+
+rf_mejor_rf_664 <- rf_training.rf.1$results[order(rf_training.rf.1$results$Accuracy, decreasing = TRUE),][1,]["Accuracy"]
+
+```
+
+NAIVE BAYES
+
+```{r}
+
+tunegrid.nb.1 <- expand.grid(laplace = 0:6,
+                       usekernel = c(TRUE,FALSE),
+                       adjust = 1:6)
+
+set.seed(1234)
+
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+rf_training.nb.1 <- train(crono_tipo_etiqueta_cronotipo_label ~ ., data = rf_train_data, 
+                 method = "naive_bayes",
+                 trControl = control.cv.10,
+                 preProcess = c("center", "scale"),
+                 tuneGrid = tunegrid.nb.1)
+
+stopCluster(cl)
+
+saveRDS(rf_training.nb.1, "modelo_rf_nb_krono")
+
+```
+
+```{r}
+
+rf_mejor_nb_664 <- rf_training.nb.1$results[order(rf_training.nb.1$results$Accuracy, decreasing = TRUE),][1,]["Accuracy"]
+
+```
+
+Crear data frame con dos columnas: Algoritmos y Máx.Accuracy
+Ordenar los algoritmos de mayor a menor "Accuracy"
+
+```{r}
+
+rf_resultados_rfe664 <- data.frame(Algoritmos = c("RF","SVML","SVMR","SVMP","NB"),
+                                     Máx.Accuracy = c(rf_mejor_rf_664$Accuracy, rf_mejor_svml_664$Accuracy, rf_mejor_svmr_664$Accuracy, rf_mejor_svmp_664$Accuracy, rf_mejor_nb_664$Accuracy))
+resultados <- rf_resultados_rfe664[order(rf_resultados_rfe664$Máx.Accuracy, decreasing = TRUE),]
+resultados
+
+```
+
+Usar los datos de test que habíamos apartado en la partición para evaluar.
+Calcular matriz de confusión: compara las predicciones realizadas con los valores reales
+Extraer de la matriz de confusión métricas de rendimiento por clase ("Sensitivity","Specificity")
+
+Matriz de confusión Random Forest
+
+```{r}
+
+set.seed(1234)
+
+rf_664_predict_rf <- predict(rf_training.rf.1, newdata = rf_test_data)
+
+rf_matriz.confusion.rf <- confusionMatrix(rf_664_predict_rf, rf_test_data$crono_tipo_etiqueta_cronotipo_label)
+rf_matriz.confusion.rf
+
+rf_matriz.confusion.rf$byClass[c(row.names(rf_matriz.confusion.rf$byClass)),c("Sensitivity","Specificity")]
+rf_matriz.confusion.rf$table
+
+```
+
+Definición de un función que añada una fila que muestre la media de las métricas de la matriz de confusión
+
+```{r}
+
+add_mean_metrics <- function(confusion_matrix) {
+  
+  metrics <- confusion_matrix$byClass[, c("Sensitivity", "Specificity")]
+  
+  mean_metrics <- colMeans(metrics, na.rm = TRUE)
+  
+  mean_metrics_row <- matrix(mean_metrics, nrow = 1)
+  
+  row.names(mean_metrics_row) <- "Mean"
+  metrics_with_mean <- rbind(metrics, mean_metrics_row)
+  return(metrics_with_mean)
+}
+
+```
+ 
+Añadir fila con medias a la matriz de confusión de Random Forest
+
+```{r}
+
+rf_matriz.confusion.rf.mean <- add_mean_metrics(rf_matriz.confusion.rf)
+rf_matriz.confusion.rf.mean
+
+```
+
+Matriz de confusión SVM Lineal
+
+```{r}
+
+set.seed(1234)
+
+rf_664_predict_svml <- predict(rf_training.svm.lineal, newdata = rf_test_data)
+
+rf_matriz.confusion.svml <- confusionMatrix(rf_664_predict_svml, rf_test_data$crono_tipo_etiqueta_cronotipo_label)
+rf_matriz.confusion.svml
+
+rf_matriz.confusion.svml$byClass[c(row.names(rf_matriz.confusion.svml$byClass)),c("Sensitivity","Specificity")]
+rf_matriz.confusion.svml$table
+
+rf_matriz.confusion.svml.mean <- add_mean_metrics(rf_matriz.confusion.svml)
+rf_matriz.confusion.svml.mean
+
+```
+
+Matriz de confusión SVM Radial
+
+```{r}
+
+set.seed(1234)
+
+rf_664_predict_svmr <- predict(rf_training.svm.radial, newdata = rf_test_data)
+
+rf_matriz.confusion.svmr <- confusionMatrix(rf_664_predict_svmr, rf_test_data$crono_tipo_etiqueta_cronotipo_label)
+rf_matriz.confusion.svmr
+
+rf_matriz.confusion.svmr$byClass[c(row.names(rf_matriz.confusion.svmr$byClass)),c("Sensitivity","Specificity","Precision","F1")]
+rf_matriz.confusion.svmr$table
+
+rf_matriz.confusion.svmr.mean <- add_mean_metrics(rf_matriz.confusion.svmr)
+rf_matriz.confusion.svmr.mean
+
+```
+
+Matriz de confusión SVM Polinomial
+
+```{r}
+
+set.seed(1234)
+
+rf_664_predict_svmp <- predict(rf_training.svm.polinomial, newdata = rf_test_data)
+
+rf_matriz.confusion.svmp <- confusionMatrix(rf_664_predict_svmp, rf_test_data$crono_tipo_etiqueta_cronotipo_label)
+rf_matriz.confusion.svmp
+
+rf_matriz.confusion.svmp$byClass[c(row.names(rf_matriz.confusion.svmp$byClass)),c("Sensitivity","Specificity","Precision","F1")]
+rf_matriz.confusion.svmp$table
+
+rf_matriz.confusion.svmp.mean <- add_mean_metrics(rf_matriz.confusion.svmr)
+rf_matriz.confusion.svmp.mean
+
+```
+
+Matriz de confusión Naive Bayes
+
+```{r}
+
+set.seed(1234)
+
+rf_664_predict_nb <- predict(rf_training.nb.1, newdata = rf_test_data)
+
+rf_matriz.confusion.nb <- confusionMatrix(rf_664_predict_nb, rf_test_data$crono_tipo_etiqueta_cronotipo_label)
+rf_matriz.confusion.nb 
+
+rf_matriz.confusion.nb$byClass[c(row.names(rf_matriz.confusion.nb$byClass)),c("Sensitivity","Specificity","Precision","F1")]
+rf_matriz.confusion.nb$table
+
+rf_matriz.confusion.nb.mean <- add_mean_metrics(rf_matriz.confusion.svmr)
+rf_matriz.confusion.nb.mean
+
+``` 
+
+Crear un data frame en el que las filas correspondan a los distintos algoritmos (RF, SVMP, SVML, SVMR, NB) y las columnas incluyan la media de cada métrica (Sensibilidad, Especificidad, Precisión Global).
+Para ello, emplearemos una versión modificada de la función add_mean_metrics que definimos antes
+
+```{r}
+
+df_mean_metrics <- function(confusion_matrix) {
+  
+  metrics <- confusion_matrix$byClass[, c("Sensitivity", "Specificity")]
+  mean_metrics <- colMeans(metrics, na.rm = TRUE)
+  
+  accuracy <- confusion_matrix$overall["Accuracy"]
+  
+  all_metrics <- c(mean_metrics, accuracy)
+  
+  return(all_metrics)
+}
+```
+
+Almacenar en variables las medias de las métricas 
+Unimos las variables usando rbind
+Convertir a data.frame para una mejor manipulación y posterior visualización
+
+```{r}
+
+rf_metrics <- df_mean_metrics(rf_matriz.confusion.rf)
+svmp_metrics <- df_mean_metrics(rf_matriz.confusion.svmp)
+svml_metrics <- df_mean_metrics(rf_matriz.confusion.svml)
+svmr_metrics <- df_mean_metrics(rf_matriz.confusion.svmr)
+nb_metrics <- df_mean_metrics(rf_matriz.confusion.nb)
+
+metrics_df <- rbind(
+  RF = rf_metrics,
+  SVMP = svmp_metrics,
+  SVML = svml_metrics,
+  SVMR = svmr_metrics,
+  NB = nb_metrics
+)
+
+metrics_df <- as.data.frame(metrics_df)
+metrics_df
+
+```
